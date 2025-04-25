@@ -133,70 +133,80 @@ func pingClient(ws *websocket.Conn, pingInterval time.Duration) {
 	}
 }
 
+// Add this near the towp with other vars
+type Message struct {
+    Type    int
+    Content []byte
+    Client  *websocket.Conn
+}
+
+var messageQueue = make(chan Message, 100) // Buffer size of 100 messages
+
+func init() {
+    // Start the message processor
+    go processMessages()
+}
+
+func processMessages() {
+    for msg := range messageQueue {
+        // Process each message synchronously
+        log.Println("Processing message:", string(msg.Content))
+        
+        // Write back to the original sender
+        msg.Client.WriteMessage(msg.Type, msg.Content)
+        
+        // Broadcast to all clients
+        mutex.Lock()
+        for client := range clients {
+            if err := client.SetWriteDeadline(time.Now().Add(10 * time.Second)); err != nil {
+                log.Println("SetWriteDeadline error:", err)
+                client.Close()
+                delete(clients, client)
+                continue
+            }
+
+            err := client.WriteMessage(msg.Type, msg.Content)
+            if err != nil {
+                log.Println("error broadcasting:", err)
+                client.Close()
+                delete(clients, client)
+            }
+
+            client.SetWriteDeadline(time.Time{})
+        }
+        mutex.Unlock()
+    }
+}
+
 func handleMessages(ws *websocket.Conn) {
-	defer func() {
-		mutex.Lock()
-		delete(clients, ws)
-		ws.Close()
-		log.Println("Closing connection")
-		mutex.Unlock()
-	}()
+    defer func() {
+        mutex.Lock()
+        delete(clients, ws)
+        ws.Close()
+        log.Println("Closing connection")
+        mutex.Unlock()
+    }()
 
-	for {
-		// read in a message
-		messageType, p, err := ws.ReadMessage()
-		if err != nil {
-			if websocket.IsUnexpectedCloseError(err, websocket.CloseGoingAway, websocket.CloseNormalClosure) {
-				log.Println("Unexpected read error:", err)
-			} else {
-				log.Println("Connection closed:", err)
-			}
-			return
-		}
+    for {
+        messageType, p, err := ws.ReadMessage()
+        if err != nil {
+            if websocket.IsUnexpectedCloseError(err, websocket.CloseGoingAway, websocket.CloseNormalClosure) {
+                log.Println("Unexpected read error:", err)
+            } else {
+                log.Println("Connection closed:", err)
+            }
+            return
+        }
 
-		// print out that message for clarity
-		log.Println("Received: ", string(p))
-
-		// Set write deadline for this response
-		if err := ws.SetWriteDeadline(time.Now().Add(10 * time.Second)); err != nil {
-			log.Println("SetWriteDeadline error:", err)
-			return
-		}
-
-		if err := ws.WriteMessage(messageType, p); err != nil {
-			log.Println("Write error:", err)
-			return
-		}
-
-		// Reset write deadline
-		ws.SetWriteDeadline(time.Time{})
-
-		go broadcastMessage(messageType, p)
-	}
+        log.Println("Received: ", string(p))
+        
+        // Queue the message instead of processing it immediately
+        messageQueue <- Message{
+            Type:    messageType,
+            Content: p,
+            Client:  ws,
+        }
+    }
 }
 
-func broadcastMessage(messageType int, message []byte) {
-	mutex.Lock()
-	defer mutex.Unlock()
-
-	log.Println("Broadcasting message to all clients:", string(message))
-	for client := range clients {
-		// Set write deadline for this broadcast
-		if err := client.SetWriteDeadline(time.Now().Add(10 * time.Second)); err != nil {
-			log.Println("SetWriteDeadline error:", err)
-			client.Close()
-			delete(clients, client)
-			continue
-		}
-
-		err := client.WriteMessage(messageType, message)
-		if err != nil {
-			log.Println("error broadcasting:", err)
-			client.Close()
-			delete(clients, client)
-		}
-
-		// Reset write deadline
-		client.SetWriteDeadline(time.Time{})
-	}
-}
+// Remove the broadcastMessage function as it's now handled in processMessages
