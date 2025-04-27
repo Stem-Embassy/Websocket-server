@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"fmt"
 	"github.com/gorilla/websocket"
 	"log"
@@ -39,6 +40,9 @@ func setupRoutes() {
 	http.HandleFunc("/", returnHomePage)
 	http.HandleFunc("/ws", wsEndpoint)
 	http.HandleFunc("/rankings", returnRankings)
+	http.HandleFunc("/send-log", sendLog)
+	http.HandleFunc("/send-controller", sendController)
+	http.HandleFunc("/health-check", healthCheck)
 }
 
 // HTTTP ENDPOINTS
@@ -49,6 +53,68 @@ func returnHomePage(w http.ResponseWriter, r *http.Request) {
 func returnRankings(w http.ResponseWriter, r *http.Request) {
 	fmt.Fprintf(w, "Rankings")
 }
+
+// HTTP POST /send-log
+func sendLog(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var data struct {
+		Log string `json:"log"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&data); err != nil {
+		http.Error(w, "Invalid request body", http.StatusBadRequest)
+		return
+	}
+
+	message := Message{
+		Type:    websocket.TextMessage,
+		Content: []byte(fmt.Sprintf(`{"log":"%s"}`, data.Log)),
+		Client:  nil, // <- indicates broadcast only
+	}
+
+	messageQueue <- message
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	json.NewEncoder(w).Encode(map[string]string{"status": "Logs sent successfully"})
+}
+
+// HTTP POST /send-controller will broadcast all data that comes from the body
+func sendController(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	// Read the raw body
+	var rawData json.RawMessage
+	if err := json.NewDecoder(r.Body).Decode(&rawData); err != nil {
+		http.Error(w, "Invalid request body", http.StatusBadRequest)
+		return
+	}
+
+	// Create message with raw JSON body
+	message := Message{
+		Type:    websocket.TextMessage,
+		Content: rawData,
+		Client:  nil, // broadcast to all clients
+	}
+
+	messageQueue <- message
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	json.NewEncoder(w).Encode(map[string]string{"status": "Controller data sent successfully"})
+}
+func healthCheck(w http.ResponseWriter, r *http.Request) {
+	w.WriteHeader(http.StatusOK)
+	fmt.Fprintf(w, "OK")
+}
+
+
 
 // WEBSOCKET FUNCS
 var upgrader = websocket.Upgrader{
@@ -63,7 +129,17 @@ func wsEndpoint(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	log.Println("- Client Connected")
+	// log.Println("- Client Connected")
+
+	// message := Message{
+	// 	Type:    websocket.TextMessage,
+	// 	Content: []byte(fmt.Sprintf(`{"log":"%s"}`, "Client Connected")),
+	// 	Client:  nil, // <- indicates broadcast only
+	// }
+
+	// messageQueue <- message
+
+
 
 	// Use shorter, more reasonable timeouts
 	pongWait := 60 * time.Second
@@ -133,70 +209,91 @@ func pingClient(ws *websocket.Conn, pingInterval time.Duration) {
 	}
 }
 
-func handleMessages(ws *websocket.Conn) {
-	defer func() {
-		mutex.Lock()
-		delete(clients, ws)
-		ws.Close()
-		log.Println("Closing connection")
-		mutex.Unlock()
-	}()
+// Add this near the towp with other vars
+type Message struct {
+    Type    int
+    Content []byte
+    Client  *websocket.Conn
+}
 
-	for {
-		// read in a message
-		messageType, p, err := ws.ReadMessage()
-		if err != nil {
-			if websocket.IsUnexpectedCloseError(err, websocket.CloseGoingAway, websocket.CloseNormalClosure) {
-				log.Println("Unexpected read error:", err)
-			} else {
-				log.Println("Connection closed:", err)
+var messageQueue = make(chan Message, 100) // Buffer size of 100 messages
+
+func init() {
+    // Start the message processor
+    go processMessages()
+}
+
+func processMessages() {
+	for msg := range messageQueue {
+		log.Println("Processing message:", string(msg.Content))
+
+		// Only write back to sender if the client is set
+		if msg.Client != nil {
+			if err := msg.Client.WriteMessage(msg.Type, msg.Content); err != nil {
+				log.Println("Error writing to original client:", err)
 			}
-			return
 		}
 
-		// print out that message for clarity
-		log.Println("Received: ", string(p))
+		// Broadcast to all clients
+		mutex.Lock()
+		for client := range clients {
+			if err := client.SetWriteDeadline(time.Now().Add(10 * time.Second)); err != nil {
+				log.Println("SetWriteDeadline error:", err)
+				client.Close()
+				delete(clients, client)
+				continue
+			}
 
-		// Set write deadline for this response
-		if err := ws.SetWriteDeadline(time.Now().Add(10 * time.Second)); err != nil {
-			log.Println("SetWriteDeadline error:", err)
-			return
+			if err := client.WriteMessage(msg.Type, msg.Content); err != nil {
+				log.Println("Error broadcasting:", err)
+				client.Close()
+				delete(clients, client)
+			}
+
+			client.SetWriteDeadline(time.Time{}) // Clear deadline
 		}
-
-		if err := ws.WriteMessage(messageType, p); err != nil {
-			log.Println("Write error:", err)
-			return
-		}
-
-		// Reset write deadline
-		ws.SetWriteDeadline(time.Time{})
-
-		go broadcastMessage(messageType, p)
+		mutex.Unlock()
 	}
 }
 
-func broadcastMessage(messageType int, message []byte) {
-	mutex.Lock()
-	defer mutex.Unlock()
 
-	log.Println("Broadcasting message to all clients:", string(message))
-	for client := range clients {
-		// Set write deadline for this broadcast
-		if err := client.SetWriteDeadline(time.Now().Add(10 * time.Second)); err != nil {
-			log.Println("SetWriteDeadline error:", err)
-			client.Close()
-			delete(clients, client)
-			continue
-		}
+func handleMessages(ws *websocket.Conn) {
+    defer func() {
+        mutex.Lock()
+        delete(clients, ws)
+        ws.Close()
+        log.Println("Closing connection")
+        mutex.Unlock()
 
-		err := client.WriteMessage(messageType, message)
-		if err != nil {
-			log.Println("error broadcasting:", err)
-			client.Close()
-			delete(clients, client)
-		}
+        // Send a message to the messageQueue to indicate the connection is closed "Client Disconnected"
+        messageQueue <- Message{
+            Type:    websocket.TextMessage,
+            Content: []byte(fmt.Sprintf(`{"log":"%s"}`, "Client Disconnected")),
+            Client:  nil, // <- indicates broadcast only
+        }
+		
+    }()
 
-		// Reset write deadline
-		client.SetWriteDeadline(time.Time{})
-	}
+    for {
+        messageType, p, err := ws.ReadMessage()
+        if err != nil {
+            if websocket.IsUnexpectedCloseError(err, websocket.CloseGoingAway, websocket.CloseNormalClosure) {
+                log.Println("Unexpected read error:", err)
+            } else {
+                log.Println("Connection closed:", err)
+            }
+            return
+        }
+
+        log.Println("Received: ", string(p))
+        
+        // Queue the message instead of processing it immediately
+        messageQueue <- Message{
+            Type:    messageType,
+            Content: p,
+            Client:  ws,
+        }
+    }
 }
+
+// Remove the broadcastMessage function as it's now handled in processMessages
